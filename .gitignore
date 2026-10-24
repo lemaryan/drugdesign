@@ -1,0 +1,11 @@
+.env
+.env.*
+!.env.example
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+*.out
+.DS_Store
+data/
+models/
+dockstring-dataset.tsv
