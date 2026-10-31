@@ -19,11 +19,14 @@ COLUMNS = [
 
 
 def load_history(path):
-    """Load experiment history, or return an empty table."""
+    """Load history, treating a blank CSV as an empty table."""
     path = Path(path)
     if not path.exists():
         return pd.DataFrame(columns=COLUMNS)
-    return pd.read_csv(path)
+    try:
+        return pd.read_csv(path)
+    except pd.errors.EmptyDataError:
+        return pd.DataFrame(columns=COLUMNS)
 
 
 def known_smiles(history):
@@ -45,19 +48,69 @@ def save_results(results, path):
     new_rows = new_rows[COLUMNS]
 
     if path.exists():
-        old_rows = pd.read_csv(path)
+        try:
+            old_rows = pd.read_csv(path)
+        except pd.errors.EmptyDataError:
+            old_rows = pd.DataFrame(columns=COLUMNS)
         new_rows = pd.concat([old_rows, new_rows], ignore_index=True)
 
     new_rows.to_csv(path, index=False)
 
 
 def summarize_history(history, limit=5):
-    """Make a short feedback summary for the next LLM prompt."""
+    """Summarize strong candidates and recent real docking results."""
     if history.empty:
         return "No previous results yet."
 
-    columns = ["smiles", "qed", "predicted_jak2", "predicted_lck", "combined_score"]
-    available = [column for column in columns if column in history.columns]
-    recent = history.tail(limit)[available]
+    history = history.copy()
+    if "smiles" in history.columns:
+        history = history.dropna(subset=["smiles"])
+        history = history.drop_duplicates(subset=["smiles"], keep="last")
 
-    return recent.to_string(index=False)
+    score_columns = [
+        "qed",
+        "predicted_jak2",
+        "predicted_lck",
+        "combined_score",
+        "docking_jak2",
+        "docking_lck",
+    ]
+    for column in score_columns:
+        if column in history.columns:
+            history[column] = pd.to_numeric(history[column], errors="coerce")
+
+    summary_columns = [
+        "smiles",
+        "qed",
+        "predicted_jak2",
+        "predicted_lck",
+        "combined_score",
+    ]
+    available = [column for column in summary_columns if column in history.columns]
+
+    if "combined_score" in history.columns:
+        top = history.dropna(subset=["combined_score"])
+        top = top.sort_values("combined_score", ascending=False).head(limit)
+    else:
+        top = history.tail(limit)
+
+    sections = ["Best candidates by combined model score:"]
+    if top.empty:
+        sections.append("No scored candidates yet.")
+    else:
+        sections.append(top[available].to_string(index=False))
+
+    docking_columns = ["docking_jak2", "docking_lck"]
+    if all(column in history.columns for column in docking_columns):
+        docked = history.dropna(subset=docking_columns).tail(limit)
+        if not docked.empty:
+            observed_columns = [
+                column for column in summary_columns + docking_columns
+                if column in docked.columns
+            ]
+            sections.extend([
+                "Recent actual DOCKSTRING results (kcal/mol):",
+                docked[observed_columns].to_string(index=False),
+            ])
+
+    return "\n".join(sections)
