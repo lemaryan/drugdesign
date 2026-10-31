@@ -11,15 +11,28 @@ and saves each result to CSV so future iterations can use experiment history.
 1. Ask the configured LLM for candidate SMILES.
 2. Validate SMILES with RDKit and calculate QED and Morgan fingerprints.
 3. Predict JAK2 and LCK docking scores using your trained Chemprop models.
-4. Rank candidates using hard filters and a simple combined score.
+4. Minimize the paper's selective-JAK2 objective, subject to a minimum QED gate.
 5. Optionally run DOCKSTRING on the top candidates.
 6. Save results in `data/experiment_history.csv`.
 7. Use previous results as short feedback for the next LLM proposal.
 
-**Important:** docking scores are treated as negative values where more negative means stronger predicted binding. Therefore:
-- JAK2: lower / more negative is better.
-- LCK: higher / less negative is better, to favor selectivity over LCK.
-- QED: higher is better.
+**Objective:** the agent minimizes the DOCKSTRING selective-JAK2 objective from the
+referenced paper:
+
+```text
+JAK2_score - min(LCK_score, -8.1) + 10 * (1 - QED)
+```
+
+The scores used during candidate selection are Chemprop predictions of DOCKSTRING
+Vina affinities. More negative Vina scores indicate stronger predicted binding.
+The formula rewards stronger JAK2 binding, weaker LCK binding (with the LCK term
+capped at -8.1), and higher QED. Candidates also need to meet the project's extra
+`MIN_QED` eligibility threshold (default `0.4`) to be selected for docking. The
+objective is recorded in the `jak2_objective` column and lower values rank better.
+Rows created with the older `combined_score` are retained in history but are not
+compared with the new objective.
+
+This objective and its docking-score direction come from the [DOCKSTRING paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC9364321/).
 
 This is a research prototype, not a validated drug-discovery system. Predicted scores are not experimental evidence.
 
@@ -27,7 +40,7 @@ This is a research prototype, not a validated drug-discovery system. Predicted s
 
 ```bash
 conda activate drugdesign
-cd /global/home/users/$USER/drug_design_clean
+cd /global/home/users/$USER/merck-drug-optimization
 ```
 
 Copy these files into your existing repository, or clone/copy the folder there. Do not recreate the environment.
@@ -70,57 +83,6 @@ Check the key is present (this does not print the key):
 python -c 'import os; print("API key loaded:", bool(os.getenv("NRP_API_KEY")))'
 ```
 
-## 3b. Load your GPU in, submit a sbatch for the GPU make sure you have enough time for your GPU to run
-
-Automatically creates a GPU batch, and runs training
-sbatch is hands Savio a set of instructions to run on its own. You can close your laptop, and Savio keeps working.
-```bash
-sbatch \
-  --job-name=chemprop \
-  --account=ic_cdss170fall \
-  --partition=savio4_gpu \
-  --qos=a5k_gpu4_ica \
-  --gres=gpu:A5000:1 \
-  --cpus-per-task=4 \
-  --time=08:00:00 \
-  --output=/global/home/users/maryanle/drug_design_clean/chemprop-%j.out \
-  --chdir=/global/home/users/maryanle/drug_design_clean \
-  --wrap='bash -lc "conda activate drugdesign && python train_models.py --message-hidden-dim 4096 --ffn-hidden-dim 4096 --depth 9 --ffn-num-layers 4 --epochs 9 --output-dir \$PWD/models/trained/wrapped_run"'
-
-
-  sbatch \
-  --job-name=chemprop \
-  --account=ic_cdss170fall \
-  --partition=savio4_gpu \
-  --qos=a5k_gpu4_ica \
-  --gres=gpu:A5000:1 \
-  --cpus-per-task=4 \
-  --time=08:00:00 \
-  --output=/global/home/users/maryanle/drug_design_clean/chemprop-%j.out \
-  --chdir=/global/home/users/maryanle/drug_design_clean \
-  --wrap='bash -lc "conda activate drugdesign && python train_models.py --message-hidden-dim 4096 --ffn-hidden-dim 4096 --depth 9 --ffn-num-layers 4 --epochs 9 --output-dir \$PWD/models/trained/wrapped_run"'
-```
-
-Double check if you have a gpu request in queue and or check if it's still running
-```bash
-squeue -u maryanle
-squeue -j 40413122
-grep -E 'message_hidden_dim|ffn_hidden_dim|depth|ffn_num_layers' \
-  /global/home/users/maryanle/drug_design_clean/models/trained/wrapped_run/jak2/config.toml
-```
-
-To cancel a queue, replace JOBID with one that is given
-```bash
-scancel JOBID
-```
-
-Check if the job has finished, replace JOBID with the one they gave you
-```bash
-tail -80 /global/home/users/maryanle/drug_design_clean/chemprop-JOBID.out
-tail -80 /global/home/users/maryanle/drug_design_clean/chemprop-40413122.out
-tail -f chemprop-JOBID.out
-```
-
 ## 4. Train the JAK2 and LCK models
 
 The included `dockstring-dataset.tsv` contains SMILES and docking-score columns for both
@@ -148,25 +110,23 @@ If the full model runs out of memory, retry with smaller dimensions. For example
 python train_models.py --message-hidden-dim 1000 --ffn-hidden-dim 1000 --depth 5 --ffn-num-layers 2
 ```
 
-based on david's recommendations, DOING THIS START IS 12:33PM
+For a quick pipeline/performance pilot on a GPU, use a reproducible 20,000-row sample
+per target, 10 epochs, and a smaller network:
+
 ```bash
-python train_models.py \
-  --message-hidden-dim 4096 \
-  --ffn-hidden-dim 4096 \
-  --depth 9 \
-  --ffn-num-layers 4 \
-  --output-dir "$PWD/models/trained/retry_20261023"
+python train_models.py --max-rows 20000 --epochs 10 --message-hidden-dim 500 --ffn-hidden-dim 500 --depth 3 --ffn-num-layers 2
 ```
 
-
+This is a smoke-test baseline, not a substitute for training and evaluating on the full
+dataset. Runtime still depends on the GPU and available resources.
 
 Training writes target-specific CSVs under `models/training_data/` and checkpoints under
 `models/trained/jak2/` and `models/trained/lck/`. Generated model files are not committed.
 After training, point the agent at those directories:
 
 ```bash
-export JAK2_MODEL_PATH="$PWD/models/trained/jak2"
-export LCK_MODEL_PATH="$PWD/models/trained/lck"
+export JAK2_MODEL_PATH="$PWD/models/trained/moderate_40434547/jak2"
+export LCK_MODEL_PATH="$PWD/models/trained/moderate_40434547/lck"
 ```
 
 The prediction adapter in `surrogate_models.py` uses the Chemprop 2 command-line API and
@@ -179,7 +139,7 @@ Chemprop environment. Check that both directories exist before launching the age
 python agent.py --demo --iterations 2
 ```
 
-This checks the molecule validation, scoring, ranking, and CSV history using a few example SMILES. It does not call the LLM, Chemprop, or DOCKSTRING.
+This checks the molecule validation, scoring, ranking, and CSV history using a few example SMILES. It does not call the LLM, Chemprop, or DOCKSTRING. Demo results are saved separately in `data/demo_experiment_history.csv` and are not used as agent memory.
 
 ## 6. Run with the LLM and trained surrogate models
 
@@ -189,16 +149,46 @@ After training the checkpoints and setting the paths above:
 python agent.py --iterations 2 --candidates 20 --dock-top 2
 ```
 
-Docking is disabled by default. To enable it, configure a DOCKSTRING adapter in `docking.py`, verify it on one known molecule, then pass `--run-docking`.
+Docking is disabled by default. The agent and Chemprop stay in the `drugdesign`
+environment. The adapter starts a separate worker in your Python 3.10 `docking`
+environment, which docks selected candidates against the DOCKSTRING `JAK2` and
+`LCK` targets. Vina affinities (kcal/mol) are saved to `docking_jak2` and
+`docking_lck`.
+
+Install DOCKSTRING in the `docking` environment and check that both targets
+load:
+
+```bash
+conda activate docking
+conda install -c conda-forge dockstring
+python -c 'from dockstring import load_target; load_target("JAK2"); load_target("LCK"); print("DOCKSTRING targets OK")'
+```
+
+Then switch back to `drugdesign`, point the adapter at the Python executable in
+the docking environment, and opt in to docking:
+
+```bash
+conda activate drugdesign
+export DOCKING_PYTHON="$HOME/.conda/envs/docking/bin/python"
+python agent.py --iterations 2 --candidates 10 --dock-top 2 --run-docking
+```
+
+Only molecules that pass the agent's filters are eligible for docking, up to
+`--dock-top` per iteration. Each selected molecule is docked against both
+targets, so this can add substantial runtime. Set `--cpus-per-task` in an
+`sbatch` request to give Vina multiple CPUs; the adapter uses
+`SLURM_CPUS_PER_TASK` when available. DOCKSTRING requires Open Babel and its
+bundled AutoDock Vina executable. The adapter also accepts the path through
+`DOCKING_PYTHON`; if unset, it looks for a sibling `docking` environment next to
+the active conda environment.
 
 ## Files
 
-- `agent.py`: simple main loop
 - `llm_proposer.py`: asks the LLM for SMILES
 - `molecule_tools.py`: RDKit validation and properties
 - `surrogate_models.py`: adapters for your trained Chemprop models
 - `scoring.py`: hard filters and ranking
-- `docking.py`: optional DOCKSTRING adapter placeholder
+- `docking.py`: optional DOCKSTRING adapter for JAK2/LCK Vina affinities
 - `memory.py`: CSV experiment history and feedback
 - `config.py`: settings and environment variables
 - `data/experiment_history.csv`: generated history
@@ -206,4 +196,14 @@ Docking is disabled by default. To enable it, configure a DOCKSTRING adapter in 
 
 ## Why some integrations are adapters
 
-The meeting notes specify Chemprop and DOCKSTRING, but do not specify the actual checkpoint paths, exact Chemprop version/API, DOCKSTRING installation/API, or the precise dataset schema. Those interfaces vary by installation, so the starter leaves these boundaries explicit rather than silently pretending they work. The main workflow and tests are runnable without them.
+The Chemprop checkpoints and DOCKSTRING runtime are configured separately. Keep
+the Chemprop version compatible with the checkpoints, and install DOCKSTRING in
+the separate docking environment described above.
+
+git status
+git branch
+git checkout drug-design-testing
+git fetch origin
+git add config.py scoring.py surrogate_models.py agent.py run_agent.sbatch docking.py llm_proposer.py memory.py README.md
+git commit -m "Update JAK2 drug design workflow and HPC configuration"
+git push -u origin drug-design-testing

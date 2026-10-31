@@ -2,7 +2,13 @@
 
 import argparse
 
-from config import DATA_DIR, DEFAULT_CANDIDATES, DEFAULT_DOCK_TOP, HISTORY_FILE
+from config import (
+    DATA_DIR,
+    DEFAULT_CANDIDATES,
+    DEFAULT_DOCK_TOP,
+    DEMO_HISTORY_FILE,
+    HISTORY_FILE,
+)
 from docking import dock_molecule
 from llm_proposer import propose_smiles
 from memory import known_smiles, load_history, save_results, summarize_history
@@ -45,14 +51,17 @@ def run_demo(iterations):
                 "qed": properties["qed"],
                 "predicted_jak2": predictions["predicted_jak2"],
                 "predicted_lck": predictions["predicted_lck"],
-                "combined_score": evaluation["combined_score"],
+                "jak2_objective": evaluation["jak2_objective"],
                 "passes_filters": evaluation["passes_filters"],
                 "docking_jak2": None,
                 "docking_lck": None,
             })
 
-        save_results(results, HISTORY_FILE)
-        print(f"Demo iteration {iteration}: saved {len(results)} molecules to {HISTORY_FILE}")
+        save_results(results, DEMO_HISTORY_FILE)
+        print(
+            f"Demo iteration {iteration}: saved {len(results)} molecules "
+            f"to {DEMO_HISTORY_FILE}"
+        )
 
     print("Demo complete. Demo predictions are placeholders, not model results.")
 
@@ -107,16 +116,15 @@ def run_agent(iterations, candidates_per_iteration, dock_top, run_docking):
                 "qed": properties["qed"],
                 "predicted_jak2": evaluation["predicted_jak2"],
                 "predicted_lck": evaluation["predicted_lck"],
-                "combined_score": evaluation["combined_score"],
+                "jak2_objective": evaluation["jak2_objective"],
                 "passes_filters": evaluation["passes_filters"],
                 "docking_jak2": None,
                 "docking_lck": None,
             }
             results.append(result)
 
-        # Highest combined scores first; only molecules passing all filters
-        # are eligible for docking.
-        results.sort(key=lambda row: row["combined_score"], reverse=True)
+        # Lower values of the selective-JAK2 objective are better.
+        results.sort(key=lambda row: row["jak2_objective"])
         selected = [row for row in results if row["passes_filters"]][:dock_top]
 
         if run_docking:
@@ -141,7 +149,7 @@ def run_agent(iterations, candidates_per_iteration, dock_top, run_docking):
                 f"JAK2={result['predicted_jak2']:.2f} | "
                 f"LCK={result['predicted_lck']:.2f} | "
                 f"QED={result['qed']:.2f} | "
-                f"score={result['combined_score']:.2f}"
+                f"JAK2 objective={result['jak2_objective']:.2f}"
             )
 
     print(f"\nFinished. Results saved to: {HISTORY_FILE}")

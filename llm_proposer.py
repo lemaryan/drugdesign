@@ -2,6 +2,7 @@
 
 import json
 import re
+import time
 
 from langchain_openai import ChatOpenAI
 
@@ -38,20 +39,43 @@ def propose_smiles(number_to_propose, history_summary="No previous results yet."
     llm = make_llm()
 
     prompt = f"""
-You are assisting a research team studying molecular docking selectivity.
-Suggest {number_to_propose} chemically plausible candidate molecules as SMILES strings.
+You are helping a medicinal chemistry team propose small molecules for selective JAK2
+binding. Suggest {number_to_propose} novel, chemically plausible candidate molecules.
 
-Research goals:
-- JAK2 docking score: more negative is better.
-- LCK docking score: less negative / higher is better for selectivity.
-- QED: higher is better.
-- Avoid repeating known SMILES.
-- Do not claim that a candidate is a real drug or that its properties are experimentally proven.
+Optimization goals:
+- Minimize the DOCKSTRING selective-JAK2 objective, using the following predicted
+  scores as estimates of Vina scores in kcal/mol:
+  JAK2 score - min(LCK score, -8.1) + 10 * (1 - QED).
+- A lower, more negative Vina score means stronger predicted binding. The objective
+  therefore favors stronger JAK2 binding, weaker LCK binding, and higher QED.
+- Keep molecules drug-like. Favor balanced, compact structures. Avoid increasing
+  molecular size or lipophilicity just to improve a docking score; large, greasy
+  molecules can score well while having poor drug-like properties.
+- As practical guidelines, favor molecules near common oral small-molecule ranges:
+  molecular weight <= 500 Da, logP <= 5, hydrogen-bond donors <= 5, hydrogen-bond
+  acceptors <= 10, and rotatable bonds <= 10. These are heuristics, not proof of
+  developability. The project also filters candidates at QED >= 0.4; prefer higher QED
+  when it does not undermine the JAK2-versus-LCK objective.
+- Favor chemically valid, single-fragment molecules without radicals. Provide varied
+  scaffolds and avoid close repeats of known SMILES.
 
-Use this history as feedback:
+How to use the history:
+- `predicted_jak2` and `predicted_lck` are Chemprop estimates of docking scores.
+- `docking_jak2` and `docking_lck`, when present, are actual DOCKSTRING/Vina scores.
+- Lower `jak2_objective` values are better. Use strong JAK2 scores, weaker LCK scores,
+  and good QED together; do not optimize docking scores alone.
+
+Candidate history:
 {history_summary}
 
-Return ONLY a JSON array of SMILES strings. No markdown and no explanations.
+Return exactly a JSON array of SMILES strings, with no markdown or explanation.
+Do not include names, properties, or extra keys.
 """
+    started = time.perf_counter()
     response = llm.invoke(prompt)
+    elapsed = time.perf_counter() - started
+    print(f"  LLM proposal request completed in {elapsed:.1f}s")
     return _extract_json_list(response.content)
+
+
+

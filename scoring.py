@@ -1,30 +1,38 @@
-"""Filter and rank candidate molecules using simple, readable rules."""
+"""Score candidate molecules with the DOCKSTRING selective-JAK2 objective."""
 
-from config import MAX_JAK2_SCORE, MIN_LCK_SCORE, MIN_QED
+from config import MIN_QED
+
+
+LCK_SCORE_CUTOFF = -8.1
+QED_PENALTY_WEIGHT = 10.0
 
 
 def evaluate_candidate(properties, predictions):
-    """Combine RDKit properties and model predictions into one result."""
+    """Calculate the selective-JAK2 objective; lower values are better.
+
+    This uses the DOCKSTRING selective-JAK2 objective with Chemprop predictions
+    as estimates of the docking scores:
+    JAK2 - min(LCK, -8.1) + 10 * (1 - QED).
+    """
     jak2 = predictions["predicted_jak2"]
     lck = predictions["predicted_lck"]
     qed = properties["qed"]
 
-    # Hard filters stop one very good metric from hiding a poor one.
-    passes_filters = (
-        jak2 <= MAX_JAK2_SCORE
-        and lck >= MIN_LCK_SCORE
-        and qed >= MIN_QED
+    # The LCK term stops rewarding weaker LCK binding once its score reaches -8.1.
+    # The QED penalty discourages poor drug-likeness while optimizing docking.
+    objective = (
+        jak2
+        - min(lck, LCK_SCORE_CUTOFF)
+        + QED_PENALTY_WEIGHT * (1.0 - qed)
     )
 
-    # Simple score for ranking. The filters above remain separate.
-    # Lower JAK2 is better, higher LCK is better, and higher QED is better.
-    # These weights are starter choices, not scientifically validated weights.
-    score = (-jak2 * 0.5) + (lck * 0.2) + (qed * 5.0)
+    # Keep the project's existing minimum QED gate as an extra drug-likeness check.
+    passes_filters = qed >= MIN_QED
 
     return {
         "predicted_jak2": jak2,
         "predicted_lck": lck,
         "qed": qed,
         "passes_filters": passes_filters,
-        "combined_score": score,
+        "jak2_objective": float(objective),
     }

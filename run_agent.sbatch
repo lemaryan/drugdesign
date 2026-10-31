@@ -46,9 +46,9 @@ python -c 'import torch; print("CUDA available:", torch.cuda.is_available())'
 
 # Run molecular design agent
 python agent.py \
-    --iterations 50 \
+    --iterations 10 \
     --candidates 20 \
-    --dock-top 2 \
+    --dock-top 5 \
     --run-docking
 
 echo "=================================="
