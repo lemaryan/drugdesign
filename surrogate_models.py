@@ -69,16 +69,3 @@ def predict_many(smiles_list):
     ]
 
 
-def predict_jak2(smiles):
-    """Return one predicted JAK2 docking score."""
-    return predict_many([smiles])[0]["predicted_jak2"]
-
-
-def predict_lck(smiles):
-    """Return one predicted LCK docking score."""
-    return predict_many([smiles])[0]["predicted_lck"]
-
-
-def predict_both(smiles):
-    """Return both target predictions for one SMILES."""
-    return predict_many([smiles])[0]

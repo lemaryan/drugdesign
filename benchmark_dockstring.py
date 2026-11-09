@@ -66,7 +66,7 @@ def main():
                 if qed is None:
                     invalid += 1
                     continue
-                objective = jak2 - min(lck, -8.1) + 10 * (1 - qed)
+                objective = jak2 - min(lck + 8.1, 0) + 10 * (1 - qed)
                 rows.append({
                     "inchikey": row.get("inchikey", ""),
                     "smiles": row["smiles"],
@@ -93,7 +93,7 @@ def main():
     lines = [
         "# DOCKSTRING Selective-JAK2 Dataset Benchmark", "",
         "Computed from `dockstring-dataset.tsv` using the paper objective:", "",
-        "`objective = JAK2 - min(LCK, -8.1) + 10 × (1 - QED)`", "",
+        "`objective = JAK2 - min(LCK + 8.1, 0) + 10 × (1 - QED)`", "",
         "Lower is better. QED was calculated from each SMILES with RDKit. This is an in-dataset reference, not a universal success threshold. The best value is an optimistic reference because these molecules are also the source dataset for the project’s surrogate models.", "",
         "## Dataset summary", "",
         f"- Valid molecules with finite JAK2 and LCK scores: **{len(rows):,}**",

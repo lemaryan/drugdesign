@@ -21,9 +21,10 @@ echo "Python: $(command -v python)"
 python -c 'import chemprop; print("Chemprop:", chemprop.__version__)'
 
 python train_models.py \
+  --max-rows 50000 \
   --message-hidden-dim 4096 \
   --ffn-hidden-dim 4096 \
   --depth 9 \
   --ffn-num-layers 4 \
-  --epochs 3 \
-  --output-dir "$PWD/models/trained/retry_20261023_${SLURM_JOB_ID:-local}"
+  --epochs 10 \
+  --output-dir "$PWD/models/trained/moderate_${SLURM_JOB_ID:-local}"

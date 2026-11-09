@@ -19,11 +19,11 @@ class TestMoleculeTools(unittest.TestCase):
 
 class TestScoring(unittest.TestCase):
     def test_filter_result_is_boolean(self):
-        properties = {"qed": 0.7}
+        properties = inspect_molecule("CCO")
         predictions = {"predicted_jak2": -8.0, "predicted_lck": -6.0}
         result = evaluate_candidate(properties, predictions)
         self.assertIsInstance(result["passes_filters"], bool)
-        self.assertIsInstance(result["combined_score"], float)
+        self.assertIsInstance(result["predicted_objective"], float)
 
 
 if __name__ == "__main__":

@@ -2,11 +2,10 @@
 
 import json
 import re
-import time
 
 from langchain_openai import ChatOpenAI
 
-from config import LLM_MODEL, NRP_API_KEY, NRP_BASE_URL
+from config import LLM_MODEL, NRP_API_KEY, NRP_BASE_URL, TARGET_JAK2_OBJECTIVE
 
 
 def make_llm():
@@ -19,6 +18,7 @@ def make_llm():
         api_key=NRP_API_KEY,
         base_url=NRP_BASE_URL,
         temperature=0.7,
+        extra_body={"chat_template_kwargs": {"enable_thinking": False}},
     )
 
 
@@ -39,31 +39,23 @@ def propose_smiles(number_to_propose, history_summary="No previous results yet."
     llm = make_llm()
 
     prompt = f"""
-You are helping a medicinal chemistry team propose small molecules for selective JAK2
-binding. Suggest {number_to_propose} novel, chemically plausible candidate molecules.
+You are proposing molecules for selective JAK2 binding. Return {number_to_propose}
+chemically valid, single-fragment SMILES with varied scaffolds.
 
-Optimization goals:
-- Minimize the DOCKSTRING selective-JAK2 objective, using the following predicted
-  scores as estimates of Vina scores in kcal/mol:
-  JAK2 score - min(LCK score, -8.1) + 10 * (1 - QED).
-- A lower, more negative Vina score means stronger predicted binding. The objective
-  therefore favors stronger JAK2 binding, weaker LCK binding, and higher QED.
-- Keep molecules drug-like. Favor balanced, compact structures. Avoid increasing
-  molecular size or lipophilicity just to improve a docking score; large, greasy
-  molecules can score well while having poor drug-like properties.
-- As practical guidelines, favor molecules near common oral small-molecule ranges:
-  molecular weight <= 500 Da, logP <= 5, hydrogen-bond donors <= 5, hydrogen-bond
-  acceptors <= 10, and rotatable bonds <= 10. These are heuristics, not proof of
-  developability. The project also filters candidates at QED >= 0.4; prefer higher QED
-  when it does not undermine the JAK2-versus-LCK objective.
-- Favor chemically valid, single-fragment molecules without radicals. Provide varied
-  scaffolds and avoid close repeats of known SMILES.
+The program calculates the predicted objective for each molecule:
+JAK2 - min(LCK + 8.1, 0) + 10 * (1 - QED)
+Lower is better. Aim for a predicted objective near {TARGET_JAK2_OBJECTIVE:.1f}.
+This is a stretch goal: the current best examples are closer to -8.4. With QED near
+0.9, a score near -11 generally needs a JAK2 prediction near -12 and an LCK prediction
+that is weaker than -8.1. Favor strong JAK2 binding, weaker LCK binding, and high QED.
+Use the separate predicted and actual examples, diverse molecules, failure reasons,
+and iteration trends as guidance. Try varied scaffolds and learn from failures, but
+do not calculate scores or decide whether a molecule passes; the program does that.
 
-How to use the history:
-- `predicted_jak2` and `predicted_lck` are Chemprop estimates of docking scores.
-- `docking_jak2` and `docking_lck`, when present, are actual DOCKSTRING/Vina scores.
-- Lower `jak2_objective` values are better. Use strong JAK2 scores, weaker LCK scores,
-  and good QED together; do not optimize docking scores alone.
+Keep molecules within these limits where possible: MW <= 500, QED >= 0.4, LogP <= 5,
+HBD <= 5, HBA <= 10, rotatable bonds <= 10, TPSA <= 140, and heavy atoms <= 40.
+The program applies these filters, checks duplicates, predicts scores, and makes all
+final ranking decisions. Return candidate SMILES only.
 
 Candidate history:
 {history_summary}
@@ -71,11 +63,5 @@ Candidate history:
 Return exactly a JSON array of SMILES strings, with no markdown or explanation.
 Do not include names, properties, or extra keys.
 """
-    started = time.perf_counter()
     response = llm.invoke(prompt)
-    elapsed = time.perf_counter() - started
-    print(f"  LLM proposal request completed in {elapsed:.1f}s")
     return _extract_json_list(response.content)
-
-
-

@@ -11,6 +11,10 @@ import sys
 RESULT_PREFIX = "DOCKING_RESULT="
 
 
+class DockingError(RuntimeError):
+    """A candidate could not be scored by the DOCKSTRING worker."""
+
+
 def _docking_python():
     """Find the Python executable in the separate docking environment."""
     configured_path = os.environ.get("DOCKING_PYTHON")
@@ -56,7 +60,7 @@ def dock_molecule(smiles):
 
     if result.returncode != 0:
         details = (result.stderr or result.stdout).strip()
-        raise RuntimeError(f"DOCKSTRING worker failed: {details[-2000:]}")
+        raise DockingError(f"DOCKSTRING worker failed: {details[-2000:]}")
 
     # DOCKSTRING may write progress messages to stdout, so look for our result
     # marker instead of assuming its output contains only JSON.

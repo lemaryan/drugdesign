@@ -4,7 +4,7 @@
 #SBATCH --partition=savio4_htc
 #SBATCH --qos=savio_normal
 #SBATCH --cpus-per-task=4
-#SBATCH --time=08:00:00
+#SBATCH --time=04:00:00
 #SBATCH --output=agent-%j.out
 #SBATCH --error=agent-%j.err
 

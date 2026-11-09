@@ -7,6 +7,7 @@ small two-column CSVs are generated under models/training_data/.
 import argparse
 import csv
 import math
+import random
 import shutil
 import subprocess
 import sys
@@ -19,12 +20,14 @@ TARGETS = ("JAK2", "LCK")
 CHEMPROP_CLI = shutil.which("chemprop")
 
 
-def prepare_target_csvs(data_path, output_dir):
+def prepare_target_csvs(data_path, output_dir, max_rows=None, seed=0):
     """Validate the input table and write one clean CSV per target."""
     output_dir.mkdir(parents=True, exist_ok=True)
     writers = []
     output_handles = []
     row_counts = {target: 0 for target in TARGETS}
+    sampled_rows = {target: [] for target in TARGETS} if max_rows else None
+    rngs = {target: random.Random(seed) for target in TARGETS}
 
     try:
         with data_path.open(newline="", encoding="utf-8") as source:
@@ -61,8 +64,24 @@ def prepare_target_csvs(data_path, output_dir):
                         ) from error
                     if not math.isfinite(value):
                         continue
-                    writer.writerow([smiles, value])
                     row_counts[target] += 1
+                    if max_rows is None:
+                        writer.writerow([smiles, value])
+                    else:
+                        # Reservoir sampling gives a reproducible uniform sample
+                        # without loading the full dataset into memory.
+                        sample = sampled_rows[target]
+                        if len(sample) < max_rows:
+                            sample.append((smiles, value))
+                        else:
+                            replacement = rngs[target].randrange(row_counts[target])
+                            if replacement < max_rows:
+                                sample[replacement] = (smiles, value)
+
+        if max_rows is not None:
+            for target, writer in zip(TARGETS, writers):
+                writer.writerows(sampled_rows[target])
+                row_counts[target] = len(sampled_rows[target])
     finally:
         for handle in output_handles:
             handle.close()
@@ -124,6 +143,10 @@ def main():
     parser.add_argument("--ffn-hidden-dim", type=int, default=4096)
     parser.add_argument("--depth", type=int, default=9)
     parser.add_argument("--ffn-num-layers", type=int, default=4)
+    parser.add_argument(
+        "--max-rows", type=int, default=None,
+        help="Optional reproducible random sample size per target (useful for quick pilots).",
+    )
     args = parser.parse_args()
 
     if min(
@@ -131,12 +154,14 @@ def main():
         args.ffn_hidden_dim, args.depth, args.ffn_num_layers,
     ) < 1:
         parser.error("Model sizes, ensemble size, and epochs must be positive")
+    if args.max_rows is not None and args.max_rows < 100:
+        parser.error("--max-rows must be at least 100")
 
     data_path = args.data.expanduser().resolve()
     if not data_path.is_file():
         parser.error(f"Dataset not found: {data_path}")
     data_dir = PROJECT_DIR / "models" / "training_data"
-    prepare_target_csvs(data_path, data_dir)
+    prepare_target_csvs(data_path, data_dir, args.max_rows, args.seed)
 
     for target in TARGETS:
         train_target(

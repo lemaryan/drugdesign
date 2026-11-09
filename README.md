@@ -9,28 +9,52 @@ and saves each result to CSV so future iterations can use experiment history.
 ## Workflow
 
 1. Ask the configured LLM for candidate SMILES.
-2. Validate SMILES with RDKit and calculate QED and Morgan fingerprints.
-3. Predict JAK2 and LCK docking scores using your trained Chemprop models.
-4. Minimize the paper's selective-JAK2 objective, subject to a minimum QED gate.
-5. Optionally run DOCKSTRING on the top candidates.
+2. Validate SMILES, calculate molecular properties, and apply hard filters.
+3. Predict JAK2 and LCK docking scores for molecules that pass.
+4. Calculate and minimize the selective-JAK2 objective.
+5. Select up to `--dock-top` eligible candidates using the predicted objective and
+   Morgan-fingerprint Tanimoto diversity, then optionally run DOCKSTRING on them.
 6. Save results in `data/experiment_history.csv`.
 7. Use previous results as short feedback for the next LLM proposal.
+
+The memory summary keeps predicted objectives separate from objectives recalculated
+with actual DOCKSTRING scores. It gives the LLM up to 15 best predicted examples,
+15 best docked examples, 10 structurally diverse examples, and 5 filter failures.
+It also reports recent filter, scaffold, and objective trends. The same molecule
+appears only once in the combined summary.
+
+Dockstring seed examples are kept in `data/dockstring_seed_memory.csv`, separate
+from the agent's experiment history. They are the 15 filter-passing dataset molecules
+with the lowest actual objective. The LLM sees them as reference examples; they are
+not counted as agent results, and exact matches are skipped during validation.
+
+The agent prints a local timestamp for each stage. It reports the LLM response time,
+Chemprop batch prediction time, each DOCKSTRING call, and total docking time at the end.
+Code applies hard limits of MW <= 500, QED >= 0.4, LogP <= 5, HBD <= 5,
+HBA <= 10, rotatable bonds <= 10, TPSA <= 140, and heavy atoms <= 40 before
+Chemprop prediction. Code also checks duplicates and computes objective scores.
 
 **Objective:** the agent minimizes the DOCKSTRING selective-JAK2 objective from the
 referenced paper:
 
 ```text
-JAK2_score - min(LCK_score, -8.1) + 10 * (1 - QED)
+JAK2_score - min(LCK_score + 8.1, 0) + 10 * (1 - QED)
 ```
 
 The scores used during candidate selection are Chemprop predictions of DOCKSTRING
 Vina affinities. More negative Vina scores indicate stronger predicted binding.
 The formula rewards stronger JAK2 binding, weaker LCK binding (with the LCK term
-capped at -8.1), and higher QED. Candidates also need to meet the project's extra
-`MIN_QED` eligibility threshold (default `0.4`) to be selected for docking. The
-objective is recorded in the `jak2_objective` column and lower values rank better.
-Rows created with the older `combined_score` are retained in history but are not
-compared with the new objective.
+capped at -8.1), and higher QED. Candidates must pass the hard molecular filters
+before Chemprop prediction and docking. Predicted and actual objectives are stored
+separately in `predicted_objective` and `actual_objective`; lower values rank better.
+
+Before docking, the agent greedily selects diverse candidates from each batch. It
+min-max normalizes the predicted objective within the eligible batch, then adds a
+penalty equal to `TANIMOTO_DIVERSITY_WEIGHT` times the candidate's maximum Morgan
+fingerprint Tanimoto similarity to candidates already selected for docking. Lower
+combined selection scores are preferred. The weight defaults to `0.25`; set the
+environment variable to `0` to use objective-only ranking. Batch-level selection
+details and predicted target scores are not stored in the main memory CSV.
 
 This objective and its docking-score direction come from the [DOCKSTRING paper](https://pmc.ncbi.nlm.nih.gov/articles/PMC9364321/).
 
@@ -50,7 +74,7 @@ Copy these files into your existing repository, or clone/copy the folder there. 
 Check what's already available:
 
 ```bash
-python -c "import rdkit, pandas, numpy; print('basic packages OK')"
+python -c "import rdkit, pandas; print('basic packages OK')"
 python -c "import chemprop; print('chemprop OK')"
 python -c "import langchain_openai, langgraph; print('agent packages OK')"
 ```
@@ -58,7 +82,7 @@ python -c "import langchain_openai, langgraph; print('agent packages OK')"
 Install only packages that are missing. Prefer your project's tested versions and your Savio module/conda setup:
 
 ```bash
-conda install -c conda-forge rdkit pandas numpy scikit-learn
+conda install -c conda-forge rdkit pandas
 pip install langchain-openai langgraph
 ```
 
@@ -74,7 +98,6 @@ echo
 export NRP_API_KEY
 export NRP_BASE_URL="https://ellm.nrp-nautilus.io/v1"
 export LLM_MODEL="qwen3"
-export QWEN_THINKING=0
 ```
 
 Check the key is present (this does not print the key):
@@ -94,8 +117,12 @@ evaluating generalization.
 From the project directory, in the environment where `chemprop` works:
 
 ```bash
+python initialize_memory.py
 python train_models.py
 ```
+
+The first command creates the separate seed memory from the source dataset. It does
+not add those molecules to `data/experiment_history.csv`.
 
 The defaults match the supplied settings: message hidden size 4096, FFN hidden size 4096,
 depth 9, and four FFN layers. The ensemble size is one, and other training settings use
@@ -125,8 +152,8 @@ Training writes target-specific CSVs under `models/training_data/` and checkpoin
 After training, point the agent at those directories:
 
 ```bash
-export JAK2_MODEL_PATH="$PWD/models/trained/moderate_40434547/jak2"
-export LCK_MODEL_PATH="$PWD/models/trained/moderate_40434547/lck"
+export JAK2_MODEL_PATH="$PWD/models/trained/jak2"
+export LCK_MODEL_PATH="$PWD/models/trained/lck"
 ```
 
 The prediction adapter in `surrogate_models.py` uses the Chemprop 2 command-line API and
@@ -139,7 +166,7 @@ Chemprop environment. Check that both directories exist before launching the age
 python agent.py --demo --iterations 2
 ```
 
-This checks the molecule validation, scoring, ranking, and CSV history using a few example SMILES. It does not call the LLM, Chemprop, or DOCKSTRING. Demo results are saved separately in `data/demo_experiment_history.csv` and are not used as agent memory.
+This checks SMILES validation, objective calculation, and CSV saving with placeholder scores. It does not call the LLM, Chemprop, or DOCKSTRING. Demo results are saved separately in `data/demo_experiment_history.csv` and are not used as agent memory.
 
 ## 6. Run with the LLM and trained surrogate models
 
@@ -170,7 +197,7 @@ the docking environment, and opt in to docking:
 ```bash
 conda activate drugdesign
 export DOCKING_PYTHON="$HOME/.conda/envs/docking/bin/python"
-python agent.py --iterations 2 --candidates 10 --dock-top 2 --run-docking
+python agent.py --iterations 2 --candidates 20 --dock-top 2 --run-docking
 ```
 
 Only molecules that pass the agent's filters are eligible for docking, up to
@@ -184,6 +211,8 @@ the active conda environment.
 
 ## Files
 
+- `agent.py`: LangGraph workflow for proposing, validating, scoring, docking, and saving
+- `initialize_memory.py`: selects the best filtered Dockstring seed examples
 - `llm_proposer.py`: asks the LLM for SMILES
 - `molecule_tools.py`: RDKit validation and properties
 - `surrogate_models.py`: adapters for your trained Chemprop models
@@ -191,7 +220,9 @@ the active conda environment.
 - `docking.py`: optional DOCKSTRING adapter for JAK2/LCK Vina affinities
 - `memory.py`: CSV experiment history and feedback
 - `config.py`: settings and environment variables
+- `benchmark_dockstring.py`: objective benchmark on the source dataset
 - `data/experiment_history.csv`: generated history
+- `data/dockstring_seed_memory.csv`: separate Dockstring reference examples
 - `tests/test_core.py`: basic unit tests
 
 ## Why some integrations are adapters
@@ -199,11 +230,3 @@ the active conda environment.
 The Chemprop checkpoints and DOCKSTRING runtime are configured separately. Keep
 the Chemprop version compatible with the checkpoints, and install DOCKSTRING in
 the separate docking environment described above.
-
-git status
-git branch
-git checkout drug-design-testing
-git fetch origin
-git add config.py scoring.py surrogate_models.py agent.py run_agent.sbatch docking.py llm_proposer.py memory.py README.md
-git commit -m "Update JAK2 drug design workflow and HPC configuration"
-git push -u origin drug-design-testing
