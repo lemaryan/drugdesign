@@ -170,6 +170,25 @@ This checks SMILES validation, objective calculation, and CSV saving with placeh
 
 ## 6. Run with the LLM and trained surrogate models
 
+For a checkpointed multi-iteration Savio run, submit `run_agent.sbatch`. The
+`persistent_loop.py` runner completes one proposal, validation, Chemprop scoring,
+selection, and DOCKSTRING cycle at a time, appends the results to CSV memory, and
+reloads that memory before the next proposal. It resumes iteration numbering from
+the last saved row. The batch script requests a termination signal three minutes
+before walltime so the current iteration can finish and checkpoint; after the job
+ends, submit it again to continue from `data/experiment_history.csv`.
+
+The script's `--iterations 100` is a per-allocation cap. A direct run can also stop
+once an actual docked objective reaches a threshold:
+
+```bash
+python persistent_loop.py --iterations 100 --candidates 20 --dock-top 5 \
+  --run-docking --resume --stop-objective -1.0
+```
+
+Only an actual DOCKSTRING `actual_objective` can trigger `--stop-objective`;
+surrogate predictions do not. Keep the same history path when resuming.
+
 After training the checkpoints and setting the paths above:
 
 ```bash

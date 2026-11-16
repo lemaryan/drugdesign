@@ -4,7 +4,8 @@
 #SBATCH --partition=savio4_htc
 #SBATCH --qos=savio_normal
 #SBATCH --cpus-per-task=4
-#SBATCH --time=04:00:00
+#SBATCH --time=08:00:00
+#SBATCH --signal=TERM@180
 #SBATCH --output=agent-%j.out
 #SBATCH --error=agent-%j.err
 
@@ -44,12 +45,15 @@ python -c 'import torch; print("CUDA available:", torch.cuda.is_available())'
 "$DOCKING_PYTHON" -c \
 'import sys, dockstring; print("Docking Python:", sys.version.split()[0], "DOCKSTRING:", dockstring.__version__)'
 
-# Run molecular design agent
-python agent.py \
-    --iterations 10 \
-    --candidates 20 \
+# Run the checkpointed loop. Resubmit this job with the same history path to resume.
+python persistent_loop.py \
+    --iterations 10000 \
+    --candidates 24 \
     --dock-top 5 \
-    --run-docking
+    --run-docking \
+    --resume \
+    --stop-objective -11.5
+
 
 echo "=================================="
 echo "EXPERIMENT COMPLETED"

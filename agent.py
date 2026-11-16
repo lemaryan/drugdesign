@@ -12,12 +12,19 @@ from config import (
     DEFAULT_CANDIDATES,
     DEFAULT_DOCK_TOP,
     DEMO_HISTORY_FILE,
+    EXPLOIT_FRACTION,
     HISTORY_FILE,
     SEED_MEMORY_FILE,
 )
 from docking import DockingError, dock_molecule
-from llm_proposer import propose_smiles
-from memory import known_smiles, load_history, save_results, summarize_history
+from llm_proposer import propose_exploit, propose_explore
+from memory import (
+    known_smiles,
+    load_history,
+    save_results,
+    summarize_history,
+    top_hits,
+)
 from molecule_tools import check_filters, inspect_molecule
 from scoring import calculate_objective, evaluate_candidate, select_diverse_candidates
 from surrogate_models import predict_many
@@ -25,11 +32,13 @@ from surrogate_models import predict_many
 
 # Example molecules are only for testing the software workflow, not drug candidates.
 DEMO_SMILES = [
+    # Fragments, to exercise the rejection path (now below the heavy-atom floor).
     "CCO",
     "CC(=O)O",
     "c1ccccc1",
-    "CCN",
-    "CCOC(=O)C",
+    # Generic drug-sized molecules, to exercise the passing path. Still placeholders.
+    "O=C(Nc1ccc(F)cc1)c1ccc2[nH]ncc2c1",
+    "O=C(Nc1ccccc1)N1CCN(c2ccccc2)CC1",
 ]
 
 
@@ -43,9 +52,10 @@ class AgentState(TypedDict, total=False):
     iteration_start: float
     chemprop_time: float
     docking_time: float
+    history_file: Any
     history: Any
     seed_memory: Any
-    proposed_smiles: list[str]
+    proposed_smiles: list[dict]
     candidates: list[dict]
     proposal_records: list[dict]
     predictions: list[dict]
@@ -96,17 +106,46 @@ def run_demo(iterations):
 
 
 def propose_node(state: AgentState):
-    """Ask the LLM for this iteration's candidates."""
+    """Ask the LLM for this iteration's candidates, in two modes.
+
+    Most of the batch goes to analogs of the best molecules found so far, which is
+    what makes the best-so-far curve move; the rest goes to new scaffolds so the
+    search keeps adding chemotype families instead of polishing one.
+    """
     iteration = state["iteration"]
     iteration_start = perf_counter()
     log(f"Iteration {iteration}/{state['iterations']}: starting")
+
     feedback = summarize_history(state["history"], state["seed_memory"])
+    hits = top_hits(state["history"])
+
+    total = state["candidates_per_iteration"]
+    exploit_count = 0 if hits.empty else min(int(round(total * EXPLOIT_FRACTION)), total)
+    explore_count = total - exploit_count
+
     llm_start = perf_counter()
     log(
-        f"Iteration {iteration}: asking LLM for "
-        f"{state['candidates_per_iteration']} molecules"
+        f"Iteration {iteration}: asking LLM for {exploit_count} analogs of "
+        f"{len(hits)} scored hits and {explore_count} new scaffolds"
     )
-    proposed = propose_smiles(state["candidates_per_iteration"], feedback)
+
+    proposed = []
+    if exploit_count:
+        smiles, stats = propose_exploit(exploit_count, hits, feedback, log)
+        proposed.extend({"smiles": item, "mode": "exploit"} for item in smiles)
+        log(
+            f"Iteration {iteration}: exploit kept {len(smiles)} analogs "
+            f"({stats['invalid']} unparseable, {stats.get('echoed', 0)} echoed parents) "
+            f"in {stats['attempts']} call(s)"
+        )
+    if explore_count:
+        smiles, stats = propose_explore(explore_count, feedback, log)
+        proposed.extend({"smiles": item, "mode": "explore"} for item in smiles)
+        log(
+            f"Iteration {iteration}: explore returned {stats['returned']} SMILES "
+            f"({stats['invalid']} unparseable) in {stats['attempts']} call(s)"
+        )
+
     log(
         f"Iteration {iteration}: LLM returned {len(proposed)} molecules in "
         f"{perf_counter() - llm_start:.2f}s"
@@ -123,15 +162,22 @@ def validate_node(state: AgentState):
     candidates = []
     records = []
 
-    for smiles in state["proposed_smiles"]:
+    for item in state["proposed_smiles"]:
+        # Accept bare strings too, so an older history or caller still works.
+        if isinstance(item, str):
+            smiles, mode = item, "explore"
+        else:
+            smiles, mode = item["smiles"], item.get("mode", "explore")
+
         properties = inspect_molecule(smiles)
         if properties is None:
-            log(f"Skipping invalid SMILES: {smiles}")
+            log(f"Skipping invalid SMILES ({mode}): {smiles}")
             records.append({
                 "iteration": iteration,
                 "smiles": smiles,
                 "passes_filters": False,
                 "proposal_status": "invalid",
+                "proposal_mode": mode,
                 "rejection_reason": "RDKit could not parse SMILES",
             })
             continue
@@ -145,6 +191,7 @@ def validate_node(state: AgentState):
                 "qed": properties["qed"],
                 "passes_filters": False,
                 "proposal_status": "dataset_duplicate",
+                "proposal_mode": mode,
                 "rejection_reason": "Already present in the Dockstring seed examples",
             })
             continue
@@ -156,6 +203,7 @@ def validate_node(state: AgentState):
                 "qed": properties["qed"],
                 "passes_filters": False,
                 "proposal_status": "duplicate",
+                "proposal_mode": mode,
                 "rejection_reason": "Canonical SMILES already appears in history",
             })
             continue
@@ -169,11 +217,13 @@ def validate_node(state: AgentState):
                 "qed": properties["qed"],
                 "passes_filters": False,
                 "proposal_status": "filtered",
+                "proposal_mode": mode,
                 "rejection_reason": reason,
             })
             already_seen.add(canonical_smiles)
             continue
 
+        properties["proposal_mode"] = mode
         candidates.append(properties)
         already_seen.add(canonical_smiles)
 
@@ -225,6 +275,7 @@ def score_node(state: AgentState):
             "actual_objective": None,
             "passes_filters": evaluation["passes_filters"],
             "proposal_status": "scored",
+            "proposal_mode": properties.get("proposal_mode", "explore"),
             "rejection_reason": None,
             "docking_jak2": None,
             "docking_lck": None,
@@ -282,8 +333,9 @@ def dock_node(state: AgentState):
 def save_node(state: AgentState):
     """Append this iteration to memory and prepare the next one."""
     started = perf_counter()
-    save_results(state["proposal_records"] + state["results"], HISTORY_FILE)
-    history = load_history(HISTORY_FILE)
+    history_file = state.get("history_file", HISTORY_FILE)
+    save_results(state["proposal_records"] + state["results"], history_file)
+    history = load_history(history_file)
     iteration = state["iteration"]
     log(f"Iteration {iteration}: results saved in {perf_counter() - started:.2f}s")
     log(f"Iteration {iteration}: valid, new molecules: {len(state['results'])}")
@@ -292,6 +344,29 @@ def save_node(state: AgentState):
         f"{sum(row['passes_filters'] for row in state['results'])}"
     )
     log(f"Iteration {iteration}: selected for docking: {len(state['selected'])}")
+
+    # Per-mode yield, so the explore/exploit split can be evaluated afterwards.
+    all_rows = state["proposal_records"] + state["results"]
+    for mode in ("exploit", "explore"):
+        rows = [row for row in all_rows if row.get("proposal_mode") == mode]
+        if not rows:
+            continue
+        usable = [row for row in rows if row.get("proposal_status") == "scored"]
+        invalid = sum(1 for row in rows if row.get("proposal_status") == "invalid")
+        duplicate = sum(
+            1 for row in rows
+            if row.get("proposal_status") in ("duplicate", "dataset_duplicate")
+        )
+        log(
+            f"Iteration {iteration}: {mode}: {len(rows)} proposed, {len(usable)} usable, "
+            f"{invalid} unparseable, {duplicate} duplicate"
+        )
+        docked = [
+            row["actual_objective"] for row in usable
+            if row.get("actual_objective") is not None
+        ]
+        if docked:
+            log(f"Iteration {iteration}: {mode}: best docked objective {min(docked):.2f}")
 
     for result in state["selected"]:
         log(
@@ -318,7 +393,7 @@ def finish_node(state: AgentState):
         f"Run finished in {perf_counter() - state['run_start']:.2f}s. "
         f"Total Chemprop time: {state['chemprop_time']:.2f}s. "
         f"Total DOCKSTRING time: {state['docking_time']:.2f}s. "
-        f"Results saved to: {HISTORY_FILE}"
+        f"Results saved to: {state.get('history_file', HISTORY_FILE)}"
     )
     return {}
 
@@ -357,19 +432,21 @@ def build_agent_graph():
     return graph.compile()
 
 
-def run_agent(iterations, candidates_per_iteration, dock_top, run_docking):
+def run_agent(iterations, candidates_per_iteration, dock_top, run_docking,
+              history_file=HISTORY_FILE, start_iteration=1):
     """Run the molecule workflow with LangGraph."""
     graph = build_agent_graph()
     initial_state = {
-        "iteration": 1,
-        "iterations": iterations,
+        "iteration": start_iteration,
+        "iterations": start_iteration + iterations - 1,
         "candidates_per_iteration": candidates_per_iteration,
         "dock_top": dock_top,
         "run_docking": run_docking,
         "run_start": perf_counter(),
         "chemprop_time": 0.0,
         "docking_time": 0.0,
-        "history": load_history(HISTORY_FILE),
+        "history_file": history_file,
+        "history": load_history(history_file),
         "seed_memory": load_history(SEED_MEMORY_FILE),
     }
     graph.invoke(initial_state, {"recursion_limit": iterations * 7 + 10})
@@ -382,6 +459,10 @@ def main():
     parser.add_argument("--dock-top", type=int, default=DEFAULT_DOCK_TOP)
     parser.add_argument("--demo", action="store_true", help="Run offline demo with placeholder predictions")
     parser.add_argument("--run-docking", action="store_true", help="Enable DOCKSTRING adapter")
+    parser.add_argument("--history", type=str, default=str(HISTORY_FILE),
+                        help="CSV memory file (defaults to data/experiment_history.csv)")
+    parser.add_argument("--resume", action="store_true",
+                        help="Continue iteration numbering from the selected history")
     args = parser.parse_args()
 
     if args.iterations < 1 or args.candidates < 1 or args.dock_top < 1:
@@ -390,7 +471,17 @@ def main():
     if args.demo:
         run_demo(args.iterations)
     else:
-        run_agent(args.iterations, args.candidates, args.dock_top, args.run_docking)
+        history_file = args.history
+        start_iteration = 1
+        if args.resume:
+            previous = load_history(history_file)
+            if not previous.empty and "iteration" in previous:
+                import pandas as pd
+                prior_iterations = pd.to_numeric(previous["iteration"], errors="coerce").dropna()
+                if not prior_iterations.empty:
+                    start_iteration = int(prior_iterations.max()) + 1
+        run_agent(args.iterations, args.candidates, args.dock_top,
+                  args.run_docking, history_file, start_iteration)
 
 
 if __name__ == "__main__":

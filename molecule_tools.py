@@ -3,6 +3,8 @@
 from rdkit import Chem, DataStructs
 from rdkit.Chem import Descriptors, QED, rdFingerprintGenerator
 
+from config import MIN_HEAVY_ATOMS
+
 
 # Morgan fingerprints are useful inputs for many molecular ML models.
 FINGERPRINT_GENERATOR = rdFingerprintGenerator.GetMorganGenerator(
@@ -52,6 +54,8 @@ def check_filters(properties):
         return False, "TPSA exceeds 140"
     if properties["heavy_atoms"] > 40:
         return False, "Too many heavy atoms"
+    if properties["heavy_atoms"] < MIN_HEAVY_ATOMS:
+        return False, f"Fewer than {MIN_HEAVY_ATOMS} heavy atoms (fragment)"
     return True, "Passed"
 
 

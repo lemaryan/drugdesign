@@ -6,7 +6,15 @@ __pycache__/
 .ipynb_checkpoints/
 *.out
 .DS_Store
-data/
 models/
 dockstring-dataset.tsv
-data/
+
+# Generated run data stays out of git, except the pre-fix baseline history: that
+# file is the before-curve for the explore/exploit comparison and cannot be
+# regenerated once the run that produced it is gone.
+# This must be "data/*" rather than "data/" - git cannot re-include a file whose
+# parent directory is itself excluded, so "data/" would make the negation below
+# silently do nothing.
+data/*
+!data/baseline_history_pre_exploit.csv
+*.err

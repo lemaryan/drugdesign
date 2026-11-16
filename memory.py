@@ -6,7 +6,13 @@ import pandas as pd
 from rdkit import Chem
 from rdkit.Chem.Scaffolds import MurckoScaffold
 
-from config import TARGET_JAK2_OBJECTIVE
+from config import (
+    ANALOG_FAMILIES,
+    LIBRARY_BEST_OBJECTIVE,
+    RECENT_SMILES_SHOWN,
+    TARGET_JAK2_OBJECTIVE,
+    TOP_HITS_SHOWN,
+)
 from molecule_tools import inspect_molecule, tanimoto_similarity
 from scoring import calculate_objective
 
@@ -21,7 +27,17 @@ COLUMNS = [
     "docking_jak2",
     "docking_lck",
     "proposal_status",
+    "proposal_mode",
     "rejection_reason",
+]
+
+HIT_COLUMNS = [
+    "smiles",
+    "scaffold",
+    "actual_objective",
+    "docking_jak2",
+    "docking_lck",
+    "qed",
 ]
 
 
@@ -86,6 +102,91 @@ def _scaffold(smiles):
     if scaffold.GetNumAtoms() == 0:
         return Chem.MolToSmiles(molecule)
     return Chem.MolToSmiles(scaffold)
+
+
+def _numeric(frame, columns):
+    """Coerce the named columns to numbers in place and return the frame."""
+    for column in columns:
+        if column in frame.columns:
+            frame[column] = pd.to_numeric(frame[column], errors="coerce")
+    return frame
+
+
+def top_hits(history, limit=None, families=None):
+    """Return the best docked molecules, spread across Murcko scaffold families.
+
+    The proposer needs real structures to do analog work on, and it needs them from
+    more than one chemotype or the search collapses onto a single family. The best
+    molecule from each of the leading `families` scaffolds is taken first, then the
+    remaining slots are filled with the next best molecules overall.
+    """
+    limit = TOP_HITS_SHOWN if limit is None else limit
+    families = ANALOG_FAMILIES if families is None else families
+    empty = pd.DataFrame(columns=HIT_COLUMNS)
+
+    if history is None or history.empty or "smiles" not in history.columns:
+        return empty
+
+    rows = history.copy()
+    rows["smiles"] = rows["smiles"].fillna("").astype(str)
+    rows = rows[rows["smiles"] != ""]
+    rows = _numeric(rows, ["actual_objective", "docking_jak2", "docking_lck", "qed"])
+    if "actual_objective" not in rows.columns:
+        return empty
+    rows = rows.dropna(subset=["actual_objective"])
+    if rows.empty:
+        return empty
+
+    rows = rows.sort_values("actual_objective").drop_duplicates("smiles", keep="first")
+    rows["scaffold"] = rows["smiles"].map(_scaffold)
+
+    # Best representative of each leading scaffold family, then fill on pure score.
+    leaders = rows.dropna(subset=["scaffold"])
+    leaders = leaders.drop_duplicates("scaffold", keep="first").head(families)
+    chosen = list(leaders.index)
+    for index in rows.index:
+        if len(chosen) >= limit:
+            break
+        if index not in chosen:
+            chosen.append(index)
+
+    return rows.loc[chosen].reindex(columns=HIT_COLUMNS).head(limit)
+
+
+def format_top_hits(hits):
+    """Render scored molecules as a numbered list the proposer can modify."""
+    if hits is None or hits.empty:
+        return "No docked molecules yet."
+
+    lines = []
+    for position, (_, row) in enumerate(hits.iterrows(), start=1):
+        parts = [f"{position}. {row['smiles']}"]
+        if pd.notna(row.get("actual_objective")):
+            parts.append(f"objective={row['actual_objective']:.2f}")
+        if pd.notna(row.get("docking_jak2")):
+            parts.append(f"JAK2={row['docking_jak2']:.1f}")
+        if pd.notna(row.get("docking_lck")):
+            parts.append(f"LCK={row['docking_lck']:.1f}")
+        if pd.notna(row.get("qed")):
+            parts.append(f"QED={row['qed']:.2f}")
+        lines.append("  ".join(parts))
+    return "\n".join(lines)
+
+
+def recent_smiles(history, limit=None):
+    """Return the most recently proposed SMILES, newest first."""
+    limit = RECENT_SMILES_SHOWN if limit is None else limit
+    if history is None or history.empty or "smiles" not in history.columns:
+        return []
+
+    rows = history.copy()
+    rows["smiles"] = rows["smiles"].fillna("").astype(str)
+    rows = rows[rows["smiles"] != ""]
+    if "iteration" in rows.columns:
+        rows = _numeric(rows, ["iteration"])
+        rows = rows.sort_values("iteration", ascending=False, kind="stable")
+    rows = rows.drop_duplicates("smiles", keep="first")
+    return rows["smiles"].head(limit).tolist()
 
 
 def _diverse_examples(candidates, limit):
@@ -192,6 +293,8 @@ def summarize_history(history, seed_memory=None):
     """Build LLM context from Dockstring examples and agent-generated history."""
     sections = [
         f"Goal: reach a JAK2 objective near {TARGET_JAK2_OBJECTIVE:.1f}; lower is better.",
+        f"The best molecule in the DOCKSTRING library scores "
+        f"{LIBRARY_BEST_OBJECTIVE:.2f}. Beating it is the point of this run.",
     ]
     seed_smiles = set()
     if seed_memory is not None and not seed_memory.empty:
@@ -207,14 +310,14 @@ def summarize_history(history, seed_memory=None):
             seed = seed.iloc[0:0]
         seed = seed.sort_values("actual_objective").drop_duplicates("smiles").head(15)
         seed_smiles = set(seed["smiles"].dropna().astype(str))
-        seed_columns = [
-            "source", "smiles", "qed", "docking_jak2", "docking_lck",
-            "actual_objective",
-        ]
-        sections.extend([
-            "Dockstring dataset seed examples (actual scores; reference knowledge only, not agent results):",
-            _format_examples(seed.to_dict("records"), seed_columns),
-        ])
+        seed_objectives = pd.to_numeric(seed["actual_objective"], errors="coerce").dropna()
+        if not seed_objectives.empty:
+            sections.append(
+                "Dockstring seed reference scores (SMILES withheld to prevent copying; "
+                "these are dataset examples, not agent results): "
+                f"n={len(seed_objectives)}, best={seed_objectives.min():.2f}, "
+                f"median={seed_objectives.median():.2f}."
+            )
     if history.empty:
         sections.append("No agent-generated molecules are available yet.")
         return "\n".join(sections)
@@ -276,24 +379,17 @@ def summarize_history(history, seed_memory=None):
     actual = actual.drop_duplicates("smiles", keep="first")
     actual_rows = actual.head(15).to_dict("records")
 
-    candidates = passing_rows.copy()
-    candidates["_selection_objective"] = candidates["predicted_objective"]
-    missing_score = candidates["_selection_objective"].isna()
-    if "actual_objective" in candidates:
-        candidates.loc[missing_score, "_selection_objective"] = candidates.loc[
-            missing_score, "actual_objective"
-        ]
-    candidates = candidates.dropna(subset=["_selection_objective"])
-    candidates = candidates.sort_values("_selection_objective")
-    diverse_rows = _diverse_examples(candidates, 10)
-
     status = history.get("proposal_status", pd.Series("", index=history.index))
     failures = history[status.isin(["filtered", "invalid"])].copy()
     if "iteration" in failures:
         failures = failures.sort_values("iteration", ascending=False)
     failures = failures.drop_duplicates("smiles", keep="first")
-    failure_rows = failures.drop_duplicates("rejection_reason", keep="first").head(5)
-    failure_rows = failure_rows.to_dict("records")
+    # Keep several unparseable SMILES, not just one, so the syntax errors are
+    # visible as a pattern; then one example per distinct filter rejection.
+    invalid_rows = failures[failures["proposal_status"].eq("invalid")].head(4)
+    filtered_rows = failures[failures["proposal_status"].eq("filtered")]
+    filtered_rows = filtered_rows.drop_duplicates("rejection_reason", keep="first").head(4)
+    failure_rows = pd.concat([invalid_rows, filtered_rows]).to_dict("records")
 
     best_lines = []
     if not predicted.empty:
@@ -319,24 +415,29 @@ def summarize_history(history, seed_memory=None):
 
     predicted_rows = unique_rows(predicted_rows)
     actual_rows = unique_rows(actual_rows)
-    diverse_rows = unique_rows(diverse_rows)
     failure_rows = unique_rows(failure_rows)
 
     sections.extend([
         "Best results: " + "; ".join(best_lines) if best_lines else "No scored results yet.",
-        "Best passing molecules by Chemprop-predicted objective:",
+        "Molecules scored by the surrogate only (no docking yet):",
         _format_examples(predicted_rows, ["smiles", "qed", "predicted_objective"]),
-        "Best passing molecules by actual DOCKSTRING objective:",
+        "Molecules with real docking scores (these are measured, trust them most):",
         _format_examples(actual_rows, [
             "smiles", "qed", "docking_jak2", "docking_lck", "actual_objective",
         ]),
-        "Structurally diverse passing examples:",
-        _format_examples(diverse_rows, [
-            "smiles", "qed", "predicted_objective", "actual_objective",
+        "Rejected proposals - learn the syntax and property errors from these:",
+        _format_examples(failure_rows, [
+            "smiles", "proposal_status", "rejection_reason",
         ]),
-        "Informative filter failures:",
-        _format_examples(failure_rows, ["smiles", "proposal_status", "rejection_reason"]),
         "Iteration trends: " + _iteration_trends(history, passed),
     ])
+
+    tried = recent_smiles(history)
+    if tried:
+        sections.extend([
+            f"Already proposed ({len(tried)} most recent) - proposing any of these "
+            "again wastes the batch:",
+            "\n".join(tried),
+        ])
 
     return "\n".join(sections)
