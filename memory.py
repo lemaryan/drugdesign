@@ -1,5 +1,6 @@
 """CSV-based memory for previously evaluated molecules."""
 
+from collections import Counter
 from pathlib import Path
 
 import pandas as pd
@@ -8,6 +9,7 @@ from rdkit.Chem.Scaffolds import MurckoScaffold
 
 from config import (
     ANALOG_FAMILIES,
+    CHEMOTYPES_AVOIDED,
     LIBRARY_BEST_OBJECTIVE,
     RECENT_SMILES_SHOWN,
     TARGET_JAK2_OBJECTIVE,
@@ -104,6 +106,35 @@ def _scaffold(smiles):
     return Chem.MolToSmiles(scaffold)
 
 
+def _chemotype(smiles):
+    """Return a generic (element- and bond-order-agnostic) Murcko scaffold.
+
+    A raw Murcko scaffold is far too fine-grained to measure chemotype diversity:
+    moving one ring nitrogen produces a different Murcko string, so a search that
+    is mining a single family looks diverse by that measure. In run 41482637 the
+    2112 docked molecules spanned 961 Murcko scaffolds but only 440 generic ones,
+    and 142 of the top 200 shared ONE generic chemotype that `top_hits` was
+    reporting as six separate families. Collapsing atoms to carbon and bonds to
+    single makes `-c3cccnc3`, `-c3ccccn3` and `-c3ccccc3` the same ring system,
+    which is what "a different chemotype" actually means here.
+    """
+    molecule = Chem.MolFromSmiles(str(smiles))
+    if molecule is None:
+        return None
+    scaffold = MurckoScaffold.GetScaffoldForMol(molecule)
+    if scaffold.GetNumAtoms() == 0:
+        return None
+    try:
+        return Chem.MolToSmiles(MurckoScaffold.MakeScaffoldGeneric(scaffold))
+    except Exception:  # noqa: BLE001 - a scaffold that will not genericize is skipped
+        return None
+
+
+def chemotype_of(smiles):
+    """Public accessor for a molecule's generic chemotype. See `_chemotype`."""
+    return _chemotype(smiles)
+
+
 def _numeric(frame, columns):
     """Coerce the named columns to numbers in place and return the frame."""
     for column in columns:
@@ -139,11 +170,35 @@ def top_hits(history, limit=None, families=None):
 
     rows = rows.sort_values("actual_objective").drop_duplicates("smiles", keep="first")
     rows["scaffold"] = rows["smiles"].map(_scaffold)
+    rows["chemotype"] = rows["smiles"].map(_chemotype)
 
-    # Best representative of each leading scaffold family, then fill on pure score.
-    leaders = rows.dropna(subset=["scaffold"])
-    leaders = leaders.drop_duplicates("scaffold", keep="first").head(families)
+    # Best representative of each leading chemotype, then fill on pure score.
+    # This used to deduplicate on the raw Murcko scaffold, which does not separate
+    # chemotypes at all: every one of the six "families" it returned was the same
+    # ring system with a nitrogen moved, so the proposer was handed six copies of
+    # one molecule and the search collapsed onto it. See `_chemotype`.
+    leaders = rows.dropna(subset=["chemotype"])
+    leaders = leaders.drop_duplicates("chemotype", keep="first").head(families)
     chosen = list(leaders.index)
+
+    # Fill the remaining slots on score, but cap how many parents any one
+    # chemotype may contribute. Without the cap the fill step undoes the family
+    # spread above: the dominant chemotype holds most of the leaderboard, so it
+    # simply retakes every remaining slot and the proposer sees one molecule again.
+    per_chemotype = Counter(rows.loc[chosen, "chemotype"].dropna())
+    cap = max(1, limit // max(families, 1))
+    for index in rows.index:
+        if len(chosen) >= limit:
+            break
+        if index in chosen:
+            continue
+        chemotype = rows.at[index, "chemotype"]
+        if chemotype is not None and per_chemotype[chemotype] >= cap:
+            continue
+        per_chemotype[chemotype] += 1
+        chosen.append(index)
+
+    # If the cap left slots empty (few chemotypes docked so far), fill on score.
     for index in rows.index:
         if len(chosen) >= limit:
             break
@@ -151,6 +206,69 @@ def top_hits(history, limit=None, families=None):
             chosen.append(index)
 
     return rows.loc[chosen].reindex(columns=HIT_COLUMNS).head(limit)
+
+
+def chemotype_census(history, limit=None):
+    """Count docked molecules per generic chemotype, busiest first.
+
+    Returns a DataFrame with one row per chemotype: how many molecules have been
+    docked on it, its best objective, and the best representative SMILES. This is
+    what tells the explore prompt which ring systems are already mined out.
+
+    `limit` caps how many chemotypes come back; None returns every one of them.
+    """
+    empty = pd.DataFrame(columns=["chemotype", "docked", "best_objective", "example"])
+
+    if history is None or history.empty or "smiles" not in history.columns:
+        return empty
+
+    rows = history.copy()
+    rows["smiles"] = rows["smiles"].fillna("").astype(str)
+    rows = rows[rows["smiles"] != ""]
+    rows = _numeric(rows, ["actual_objective"])
+    if "actual_objective" not in rows.columns:
+        return empty
+    rows = rows.dropna(subset=["actual_objective"])
+    if rows.empty:
+        return empty
+
+    rows = rows.sort_values("actual_objective").drop_duplicates("smiles", keep="first")
+    rows["chemotype"] = rows["smiles"].map(_chemotype)
+    rows = rows.dropna(subset=["chemotype"])
+    if rows.empty:
+        return empty
+
+    grouped = rows.groupby("chemotype", sort=False).agg(
+        docked=("actual_objective", "size"),
+        best_objective=("actual_objective", "min"),
+        example=("smiles", "first"),
+    )
+    grouped = grouped.sort_values("docked", ascending=False).reset_index()
+    return grouped if limit is None else grouped.head(limit)
+
+
+def format_chemotype_census(census, total_docked=None):
+    """Render the mined chemotypes as an explicit avoid-list for the proposer."""
+    if census is None or census.empty:
+        return ""
+
+    lines = [
+        "CHEMOTYPES ALREADY MINED. Each line is a ring system this run has already "
+        "docked many molecules on, with one example. Proposals built on any of "
+        "these are wasted: that neighbourhood is explored and its analogs are "
+        "already measured. Return ring systems that are NOT in this list."
+    ]
+    for position, (_, row) in enumerate(census.iterrows(), start=1):
+        share = ""
+        if total_docked:
+            share = f", {100 * row['docked'] / total_docked:.0f}% of all docking"
+        lines.append(
+            f"  {position}. {row['example']}\n"
+            f"     ({int(row['docked'])} molecules docked on this ring system"
+            f"{share}; best objective {row['best_objective']:.2f}) - DO NOT PROPOSE "
+            f"THIS RING SYSTEM AGAIN."
+        )
+    return "\n".join(lines)
 
 
 def format_top_hits(hits):

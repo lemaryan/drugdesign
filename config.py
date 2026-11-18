@@ -37,7 +37,11 @@ TANIMOTO_DIVERSITY_WEIGHT = float(os.getenv("TANIMOTO_DIVERSITY_WEIGHT", "0.25")
 # --- Proposal strategy -------------------------------------------------------
 # Share of each batch spent on analogs of the current best molecules (the
 # expected-improvement analogue). The remainder goes to novel scaffolds.
-EXPLOIT_FRACTION = float(os.getenv("EXPLOIT_FRACTION", "0.7"))
+# Lowered from 0.7: by iteration 700 only 2.1% of exploit proposals survived to
+# be scored (79% were duplicates) and the best objective had not moved in 450
+# iterations. Analog work on the leading family is finished; the batch is worth
+# more spent on chemotypes that have never been docked.
+EXPLOIT_FRACTION = float(os.getenv("EXPLOIT_FRACTION", "0.4"))
 # Lower size bound. A 9-12 heavy-atom fragment cannot be a selective kinase
 # inhibitor, and docking one wastes the most expensive step in the loop. Every
 # molecule in the run's top 15 has at least 20 heavy atoms, and this floor would
@@ -51,6 +55,13 @@ MIN_HEAVY_ATOMS = int(os.getenv("MIN_HEAVY_ATOMS", "16"))
 # the analog work at neighbourhoods that have not been explored yet.
 TOP_HITS_SHOWN = int(os.getenv("TOP_HITS_SHOWN", "12"))
 ANALOG_FAMILIES = int(os.getenv("ANALOG_FAMILIES", "6"))
+# How many already-mined chemotypes to name in the explore prompt as an explicit
+# avoid-list. Families here are generic (element-agnostic) Murcko scaffolds, not
+# raw ones: see memory._chemotype for why the raw scaffold cannot measure this.
+CHEMOTYPES_AVOIDED = int(os.getenv("CHEMOTYPES_AVOIDED", "6"))
+# Reject an explore proposal whose generic chemotype has already been docked this
+# many times. 0 disables the check and lets any chemotype through.
+CHEMOTYPE_SATURATION = int(os.getenv("CHEMOTYPE_SATURATION", "25"))
 # Recently tried SMILES shown to the proposer so it can avoid duplicates. Raised
 # with the batch size, since a 40-candidate batch repeats more without it.
 RECENT_SMILES_SHOWN = int(os.getenv("RECENT_SMILES_SHOWN", "60"))

@@ -8,6 +8,8 @@ from typing import Any, TypedDict
 from langgraph.graph import END, START, StateGraph
 
 from config import (
+    CHEMOTYPES_AVOIDED,
+    CHEMOTYPE_SATURATION,
     DATA_DIR,
     DEFAULT_CANDIDATES,
     DEFAULT_DOCK_TOP,
@@ -19,6 +21,9 @@ from config import (
 from docking import DockingError, dock_molecule
 from llm_proposer import propose_exploit, propose_explore
 from memory import (
+    chemotype_census,
+    chemotype_of,
+    format_chemotype_census,
     known_smiles,
     load_history,
     save_results,
@@ -119,6 +124,18 @@ def propose_node(state: AgentState):
     feedback = summarize_history(state["history"], state["seed_memory"])
     hits = top_hits(state["history"])
 
+    # Ring systems already mined, named explicitly for the explore prompt. Without
+    # this the proposer keeps rebuilding the dominant family under new substituents.
+    full_census = chemotype_census(state["history"])
+    docked_total = int(full_census["docked"].sum()) if not full_census.empty else 0
+    census = full_census.head(CHEMOTYPES_AVOIDED)
+    avoid_block = format_chemotype_census(census, docked_total)
+    if not census.empty:
+        log(
+            f"Iteration {iteration}: {len(census)} mined chemotype(s) named in the "
+            f"explore avoid-list; busiest has {int(census['docked'].iloc[0])} dockings"
+        )
+
     total = state["candidates_per_iteration"]
     exploit_count = 0 if hits.empty else min(int(round(total * EXPLOIT_FRACTION)), total)
     explore_count = total - exploit_count
@@ -139,7 +156,7 @@ def propose_node(state: AgentState):
             f"in {stats['attempts']} call(s)"
         )
     if explore_count:
-        smiles, stats = propose_explore(explore_count, feedback, log)
+        smiles, stats = propose_explore(explore_count, feedback, log, avoid_block)
         proposed.extend({"smiles": item, "mode": "explore"} for item in smiles)
         log(
             f"Iteration {iteration}: explore returned {stats['returned']} SMILES "
@@ -161,6 +178,19 @@ def validate_node(state: AgentState):
     seed_smiles = known_smiles(state["seed_memory"])
     candidates = []
     records = []
+
+    # Docking count per generic chemotype, to reject explore proposals that are
+    # really the dominant family in disguise. Exploit proposals are exempt: an
+    # analog of a leading molecule is SUPPOSED to share its chemotype.
+    saturated = {}
+    if CHEMOTYPE_SATURATION > 0:
+        census = chemotype_census(state["history"])
+        if not census.empty:
+            saturated = {
+                row["chemotype"]: int(row["docked"])
+                for _, row in census.iterrows()
+                if row["docked"] >= CHEMOTYPE_SATURATION
+            }
 
     for item in state["proposed_smiles"]:
         # Accept bare strings too, so an older history or caller still works.
@@ -207,6 +237,27 @@ def validate_node(state: AgentState):
                 "rejection_reason": "Canonical SMILES already appears in history",
             })
             continue
+
+        if mode == "explore" and saturated:
+            chemotype = chemotype_of(canonical_smiles)
+            if chemotype in saturated:
+                log(
+                    f"Skipping saturated chemotype "
+                    f"({saturated[chemotype]} already docked): {canonical_smiles}"
+                )
+                records.append({
+                    "iteration": iteration,
+                    "smiles": canonical_smiles,
+                    "qed": properties["qed"],
+                    "passes_filters": False,
+                    "proposal_status": "saturated_chemotype",
+                    "proposal_mode": mode,
+                    "rejection_reason": (
+                        f"Chemotype already has {saturated[chemotype]} docked molecules"
+                    ),
+                })
+                already_seen.add(canonical_smiles)
+                continue
 
         passes, reason = check_filters(properties)
         if not passes:
@@ -357,10 +408,22 @@ def save_node(state: AgentState):
             1 for row in rows
             if row.get("proposal_status") in ("duplicate", "dataset_duplicate")
         )
+        saturated_count = sum(
+            1 for row in rows if row.get("proposal_status") == "saturated_chemotype"
+        )
         log(
             f"Iteration {iteration}: {mode}: {len(rows)} proposed, {len(usable)} usable, "
-            f"{invalid} unparseable, {duplicate} duplicate"
+            f"{invalid} unparseable, {duplicate} duplicate, "
+            f"{saturated_count} saturated chemotype"
         )
+        if mode == "explore":
+            fresh = {
+                chemotype_of(row["smiles"]) for row in usable if row.get("smiles")
+            }
+            log(
+                f"Iteration {iteration}: explore reached "
+                f"{len(fresh - {None})} distinct chemotype(s)"
+            )
         docked = [
             row["actual_objective"] for row in usable
             if row.get("actual_objective") is not None

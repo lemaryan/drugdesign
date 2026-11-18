@@ -1,0 +1,45 @@
+# Render the proposed cell against a stub `dataset` to check layout/API.
+import io, numpy as np, pandas as pd
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+from PIL import Image
+from rdkit import Chem
+from rdkit.Chem.Draw import rdMolDraw2D
+from rdkit import RDLogger
+RDLogger.DisableLog("rdApp.*")
+
+def transparent_mol_image(smiles, size=(420, 240)):
+    drawer = rdMolDraw2D.MolDraw2DCairo(*size)
+    drawer.drawOptions().clearBackground = False
+    drawer.DrawMolecule(Chem.MolFromSmiles(smiles))
+    drawer.FinishDrawing()
+    return Image.open(io.BytesIO(drawer.GetDrawingText()))
+
+dataset = pd.DataFrame({
+    "smiles": ["O1C(CC2=C1N=CC=C2C3=CC=C(N(C)C)C=C3)(C)C(=O)NC(C)C", "CCO"],
+    "JAK2": [-10.1, -4.0], "LCK": [-7.9, -3.0],
+    "QED": [0.930181172815389, 0.4],
+})
+dataset["objective"] = (dataset["JAK2"].to_numpy()
+                        - np.minimum(dataset["LCK"].to_numpy() + 8.1, 0)
+                        + 10 * (1 - dataset["QED"]))
+
+# ---- cell body under test ----
+best = dataset.dropna(subset=["objective"]).nsmallest(1, "objective").iloc[0]
+
+plt.figure(figsize=(8, 5.5))
+plt.imshow(transparent_mol_image(best["smiles"], size=(640, 360)))
+plt.xticks([]); plt.yticks([]); plt.gca().set_frame_on(False)
+plt.xlabel(f"objective {best['objective']:.2f}\n"
+           f"JAK2 {best['JAK2']:.1f}   LCK {best['LCK']:.1f}\n"
+           f"QED {best['QED']:.2f}",
+           fontsize=16, fontweight="bold", labelpad=6)
+plt.ylabel(f"Best in DOCKSTRING dataset\n"
+           f"(n = {dataset['objective'].notna().sum():,}, "
+           f"mean {dataset['objective'].mean():.2f})",
+           fontweight="bold", fontsize=20)
+plt.suptitle("Best Molecule in the DOCKSTRING Dataset", fontweight="bold", size=20)
+plt.tight_layout()
+plt.savefig(".dock_tmp/preview_big.png", dpi=150, transparent=True)
+print("rendered ok; best objective =", round(float(best["objective"]), 4))

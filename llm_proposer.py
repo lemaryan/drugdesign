@@ -92,6 +92,37 @@ Building fused ring systems:
     O=C(Nc1ccc(F)cc1)c1cnn2ccccc12      pyrazolo[1,5-a]pyrimidine-3-carboxamide
   Change the OCH3, the F, the aniline ring, or add substituents to the outer rings.
   Leave the `c2...c23` and `c2...c2c1` fused portions exactly as written.
+
+- The templates above are all 4-aminopyrimidine or 5-carboxamide chemotypes. To
+  widen the search, these verified molecules cover RING SYSTEMS the run has not
+  mined. Each one parses, passes every property filter, and is a different ring
+  system from the others. Use them the same way: keep the ring system, change the
+  peripheral substituents.
+    Cc1ccc(Nc2nccc(-c3cccnc3)n2)cc1        2-anilinopyrimidine
+    Cc1nc(Nc2nccc(C)n2)sc1C(=O)NC          2-aminothiazole-5-carboxamide
+    Nc1n[nH]c(C(=O)Nc2ccc(F)cc2)c1         3-aminopyrazole-5-carboxamide
+    O=C(Nc1ccc(Cl)cc1)Nc1ccc(OC)cc1        diaryl urea
+    O=C1Nc2ccccc2C1=Cc1cc[nH]c1C           3-substituted oxindole
+    COc1ccc(Nc2cnc3ccccc3n2)cc1            quinoxalin-2-amine
+    COc1ccc(Nc2nc3ccccc3s2)cc1             benzothiazol-2-amine
+    COc1ccc(Nc2nc3ccccc3o2)cc1             benzoxazol-2-amine
+    COc1ccc(Nc2nc3ccccc3[nH]2)cc1          benzimidazol-2-amine
+    COc1ccc(Nc2nccc3ccccc23)cc1            isoquinolin-1-amine
+    COc1ccc(Nc2nncc3ccccc23)cc1            phthalazin-1-amine
+    COc1ccc(Nc2cnnc3ccccc23)cc1            cinnolin-4-amine
+    COc1ccc(Nc2ncnc3nccnc23)cc1            pteridin-4-amine
+    COc1ccc(Nc2ncnc3sccc23)cc1             thieno[2,3-d]pyrimidin-4-amine
+    COc1ccc(Nc2ncnn3cccc23)cc1             pyrrolo[2,1-f]triazin-4-amine
+    COc1ccc(Nc2ncnc(N3CCOCC3)n2)cc1        1,3,5-triazin-2-amine
+    Cn1c(=O)ccc2cnc(Nc3ccccc3)nc21         pyrido[2,3-d]pyrimidin-7-one
+    Cc1cnc2ccc(-c3ccc(F)cc3)cn12           imidazo[1,2-a]pyridine
+    Cc1cnc2ccc(-c3ccccc3)nn12              imidazo[1,2-b]pyridazine
+    Nc1n[nH]c2ccc(-c3ccc(F)cc3)cc12        indazol-3-amine
+    Cc1cc2ccc(-c3ccc(F)cc3)nc2[nH]1        7-azaindole
+    O=c1cc(-c2ccncc2)oc2ccccc12            chromen-4-one
+    O=C1CCc2ccccc2N1c1ccncc1               3,4-dihydroquinolin-2(1H)-one
+    Cc1ccc(S(=O)(=O)Nc2ccc(-c3ccncc3)cc2)cc1   biaryl sulfonamide
+    O=C(c1ccc(-c2ccncc2)cc1)N1CCN(C)CC1    aryl piperazine amide
 - A single (unfused) ring you may write freely: benzene c1ccccc1, pyridine c1ccncc1,
   pyrimidine c1cncnc1, pyrazole c1cc[nH]n1, imidazole c1c[nH]cn1, thiophene c1ccsc1,
   piperazine C1CNCCN1, morpholine C1COCCN1, piperidine C1CCNCC1.
@@ -402,23 +433,42 @@ markdown and no explanation. No names, properties, or extra keys.
     return kept[:number_to_propose] + invalid, stats
 
 
-def propose_explore(number_to_propose, history_summary, log=None):
-    """Generate new scaffolds, to add chemotype families rather than deepen one."""
+def propose_explore(number_to_propose, history_summary, log=None, avoid_block=""):
+    """Generate new chemotypes, to add ring systems rather than deepen one.
+
+    `avoid_block` is memory.format_chemotype_census output: the ring systems this
+    run has already docked heavily. Naming them explicitly is what stops the model
+    from re-proposing the dominant family, which plain "use new scaffolds" wording
+    did not do - 142 of the run's top 200 molecules shared a single ring system.
+    """
     if number_to_propose < 1:
         return [], {"attempts": 0, "returned": 0, "invalid": 0}
 
+    avoid_section = f"\n{avoid_block}\n" if avoid_block else ""
+
     prompt = f"""
 You are proposing molecules for selective JAK2 binding. Your job in this batch is
-SCAFFOLD EXPLORATION: return {number_to_propose} molecules built on scaffolds that
-do not appear in the history below.
+CHEMOTYPE EXPLORATION: return {number_to_propose} molecules built on RING SYSTEMS
+that this run has not docked before.
 
 {_objective_block()}
+{avoid_section}
+What counts as a new chemotype: a different ring system. Moving one nitrogen
+around a ring, changing a substituent, or adding a methyl is NOT a new chemotype -
+that is analog work, and another batch does it. Changing a quinazoline to a
+benzothiazole, or a fused bicycle to a biaryl amide, IS a new chemotype.
 
 Aim for ATP-competitive kinase chemotypes with a hinge-binding donor-acceptor pair
-and a drug-like size, around 300-450 Da. Use distinct scaffold classes across your
-proposals, and do not return several variations of one core: a later batch handles
-optimisation, this one is for coverage. Each proposal should be a different
-chemotype from the others in this batch.
+and a drug-like size, around 300-450 Da. All {number_to_propose} proposals must be
+different ring systems from EACH OTHER as well as from the history: this batch is
+for coverage, and several variations of one core waste it.
+
+The objective still applies, and two of its three terms are where the headroom is:
+- QED is weighted 10. Aim for QED above 0.90; the leading family stalls at 0.90
+  and each 0.01 of QED is worth 0.1 of objective.
+- The LCK penalty stops entirely once LCK is weaker than -8.1. JAK2 and LCK
+  correlate at 0.80, so a chemotype that binds JAK2 well while sitting poorly in
+  the LCK pocket is worth more than one that simply binds JAK2 harder.
 
 {PROPERTY_LIMITS}
 
